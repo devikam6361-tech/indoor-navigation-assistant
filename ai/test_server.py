@@ -388,5 +388,133 @@ class HomeLayoutApiTests(unittest.TestCase):
         self.assertEqual(history[0]["speech_error"], "audio output unavailable")
 
 
+    def test_rooms_endpoint_lists_rooms_with_baseline(self):
+        """GET /api/rooms returns each room that has a saved baseline."""
+        # Save baselines for two different rooms.
+        self.model.boxes = [FakeBox(0, 0.91, [4, 4, 20, 24])]
+        self.post_baseline()                                            # Living room
+
+        bedroom_payload = {
+            "room_name": "Bedroom",
+            "image": self.image_data,
+            "replace": False,
+        }
+        self.client.post("/api/baseline", json=bedroom_payload)        # Bedroom
+
+        response = self.client.get("/api/rooms")
+
+        self.assertEqual(response.status_code, 200)
+        rooms = response.get_json()["rooms"]
+        room_names = {r["room_name"] for r in rooms}
+        self.assertIn("Living room", room_names)
+        self.assertIn("Bedroom", room_names)
+        # Each entry must carry a detection count.
+        for room in rooms:
+            self.assertIn("detection_count", room)
+            self.assertIsInstance(room["detection_count"], int)
+            self.assertIn("captured_at", room)
+
+    def test_rooms_endpoint_returns_empty_list_when_no_baselines_saved(self):
+        """GET /api/rooms returns an empty list before any baseline is captured."""
+        response = self.client.get("/api/rooms")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["rooms"], [])
+
+    def test_rooms_endpoint_shows_only_active_baseline_not_replaced_one(self):
+        """After replacing a baseline, /api/rooms still lists the room only once."""
+        self.post_baseline()
+        self.post_baseline(replace=True)
+
+        rooms = self.client.get("/api/rooms").get_json()["rooms"]
+
+        self.assertEqual(len(rooms), 1)
+        self.assertEqual(rooms[0]["room_name"], "Living room")
+
+    def test_comparison_endpoint_returns_both_baseline_and_latest(self):
+        """GET /api/comparison returns the baseline image and the latest scan."""
+        self.model.boxes = [FakeBox(0, 0.91, [4, 4, 20, 24])]
+        self.post_baseline()
+        self.post_observation()
+
+        response = self.client.get(
+            "/api/comparison?room_name=Living%20room"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIsNotNone(data["baseline"])
+        self.assertIsNotNone(data["latest"])
+        self.assertTrue(data["baseline"]["image_data_url"].startswith("data:image/jpeg;base64,"))
+        self.assertTrue(data["latest"]["image_data_url"].startswith("data:image/jpeg;base64,"))
+        self.assertIsInstance(data["latest"]["detections"], list)
+
+    def test_comparison_endpoint_returns_null_latest_before_any_observation(self):
+        """GET /api/comparison returns null latest if monitoring has not started."""
+        self.model.boxes = [FakeBox(0, 0.91, [4, 4, 20, 24])]
+        self.post_baseline()
+
+        response = self.client.get(
+            "/api/comparison?room_name=Living%20room"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIsNotNone(data["baseline"])
+        self.assertIsNone(data["latest"])
+
+    def test_comparison_endpoint_returns_null_for_unknown_room(self):
+        """GET /api/comparison returns null baseline for a room with no data."""
+        response = self.client.get(
+            "/api/comparison?room_name=Unknown%20room"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIsNone(data["baseline"])
+        self.assertIsNone(data["latest"])
+
+    def test_comparison_endpoint_rejects_empty_room_name(self):
+        """GET /api/comparison rejects an empty room_name with 400."""
+        response = self.client.get("/api/comparison?room_name=")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("error", response.get_json())
+
+    def test_multiple_rooms_are_tracked_independently(self):
+        """Baselines for different rooms never share change events or latest scans."""
+        # Baseline for Living room with a chair.
+        self.model.boxes = [FakeBox(0, 0.91, [4, 4, 20, 24])]
+        self.post_baseline()
+
+        # Baseline for Bedroom with a bottle.
+        self.model.boxes = [FakeBox(1, 0.85, [10, 10, 30, 30])]
+        bedroom_payload = {
+            "room_name": "Bedroom",
+            "image": self.image_data,
+            "replace": False,
+        }
+        self.client.post("/api/baseline", json=bedroom_payload)
+
+        # Observe Bedroom with a moved bottle.
+        self.model.boxes = [FakeBox(1, 0.84, [50, 30, 62, 46])]
+        for _ in range(3):
+            self.client.post(
+                "/api/observe",
+                json={"room_name": "Bedroom", "image": self.image_data},
+            )
+
+        # Living room must have no history.
+        living_history = self.client.get(
+            "/api/alerts?room_name=Living%20room"
+        ).get_json()["history"]
+        bedroom_history = self.client.get(
+            "/api/alerts?room_name=Bedroom"
+        ).get_json()["history"]
+
+        self.assertEqual(living_history, [])
+        self.assertGreater(len(bedroom_history), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

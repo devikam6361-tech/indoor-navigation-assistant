@@ -7,6 +7,21 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Local databases and test artifacts
+*.sqlite
+*.sqlite3
+*.db
+.coverage
+coverage/
+
 node_modules
 dist
 dist-ssr

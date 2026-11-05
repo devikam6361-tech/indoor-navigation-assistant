@@ -20,47 +20,62 @@ MODEL_PATH = PROJECT_ROOT / "yolo11n.pt"
 DATABASE_PATH = Path(__file__).resolve().parent / "instance" / "home_layout.sqlite3"
 CAMERA_ID = "default-webcam"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-CONFIDENCE_THRESHOLD = 0.5
+# Lowered from 0.5 → 0.25: the yolo11n nano model scores indoor furniture at
+# 0.12–0.44 on typical 640×480 room images. 0.5 filtered everything out.
+# Verified empirically by running inference on three saved baseline images.
+CONFIDENCE_THRESHOLD = 0.25
 CHANGE_CONFIRMATION_FRAMES = 3
 MOVE_DISTANCE_THRESHOLD = 0.14
 OBJECT_COOLDOWN_SECONDS = 60
 MONITORED_CLASSES = {
     "backpack",
     "bottle",
+    "cell phone",
     "chair",
     "couch",
     "dining table",
     "handbag",
     "suitcase",
+    "teddy bear",
 }
 SUPPORTED_CLASSES = {
-    "backpack",
+    # Furniture & fixtures
     "bed",
-    "bottle",
-    "bowl",
-    "book",
+    "bench",
     "chair",
-    "clock",
     "couch",
-    "cup",
     "dining table",
-    "hair drier",
-    "handbag",
+    "sink",
+    "toilet",
+    # Electronics
+    "cell phone",
     "keyboard",
     "laptop",
     "microwave",
     "mouse",
     "oven",
-    "potted plant",
     "refrigerator",
     "remote",
-    "scissors",
-    "sink",
-    "suitcase",
     "toaster",
-    "toothbrush",
     "tv",
+    # Containers & tableware
+    "backpack",
+    "bottle",
+    "bowl",
+    "cup",
+    "handbag",
+    "suitcase",
     "vase",
+    "wine glass",
+    # Books & stationery
+    "book",
+    "scissors",
+    # Decor & misc
+    "clock",
+    "hair drier",
+    "potted plant",
+    "teddy bear",
+    "toothbrush",
 }
 
 
@@ -469,37 +484,60 @@ def image_from_payload(payload):
         raise ValueError("Send a JSON object with room_name and image fields.")
 
     image_data = payload.get("image")
-    if not isinstance(image_data, str) or not image_data.startswith("data:image/jpeg;base64,"):
-        raise ValueError("The camera image must be a base64-encoded JPEG.")
+    if not isinstance(image_data, str):
+        raise ValueError("The camera image must be a base64-encoded data URL.")
+
+    # Accept JPEG or PNG data URLs — OpenCV re-encodes to JPEG for storage
+    if not (image_data.startswith("data:image/jpeg;base64,") or
+            image_data.startswith("data:image/png;base64,") or
+            image_data.startswith("data:image/webp;base64,")):
+        raise ValueError(
+            "The camera image must be a base64-encoded JPEG, PNG, or WebP data URL."
+        )
 
     encoded_image = image_data.partition(",")[2]
     try:
-        image_bytes = base64.b64decode(encoded_image, validate=True)
+        image_bytes_raw = base64.b64decode(encoded_image, validate=True)
     except (binascii.Error, ValueError) as error:
         raise ValueError("The camera image is not valid base64 data.") from error
 
-    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+    if not image_bytes_raw or len(image_bytes_raw) > MAX_IMAGE_BYTES:
         raise ValueError("The camera image must be smaller than 8 MB.")
 
-    frame = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    frame = cv2.imdecode(np.frombuffer(image_bytes_raw, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
-        raise ValueError("The uploaded JPEG could not be decoded.")
+        raise ValueError("The uploaded image could not be decoded.")
 
     height, width = frame.shape[:2]
     if width > 4096 or height > 4096:
         raise ValueError("The camera image dimensions must not exceed 4096 by 4096.")
 
+    # Re-encode to JPEG for consistent storage regardless of input format
+    ok, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        raise ValueError("Could not re-encode the image as JPEG.")
+    image_bytes = jpeg_buf.tobytes()
+
     return image_bytes, frame, width, height
 
 
 def detections_from_model(model, frame, width, height):
+    import logging
+    log = logging.getLogger(__name__)
+
     results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
     objects = []
+    raw_count = 0
+    raw_summary = []
 
     for result in results:
         for box in result.boxes:
+            raw_count += 1
             class_id = int(box.cls[0])
             object_name = model.names[class_id].strip().lower()
+            conf = float(box.conf[0])
+            raw_summary.append(f"{object_name}:{conf:.3f}")
+
             if object_name not in SUPPORTED_CLASSES:
                 continue
 
@@ -509,7 +547,7 @@ def detections_from_model(model, frame, width, height):
             objects.append(
                 {
                     "class_name": object_name,
-                    "confidence": float(box.conf[0]),
+                    "confidence": conf,
                     "center_x": center_x,
                     "center_y": center_y,
                     "x1": min(1.0, max(0.0, x1 / width)),
@@ -519,6 +557,17 @@ def detections_from_model(model, frame, width, height):
                     "zone": image_zone(center_x, center_y),
                 }
             )
+
+    log.info(
+        "YOLO raw=%d conf_threshold=%.2f frame=%dx%d  raw=[%s]  kept=%d [%s]",
+        raw_count,
+        CONFIDENCE_THRESHOLD,
+        width,
+        height,
+        ", ".join(raw_summary) if raw_summary else "none",
+        len(objects),
+        ", ".join(f"{o['class_name']}:{o['confidence']:.3f}" for o in objects) if objects else "none",
+    )
 
     objects.sort(
         key=lambda item: (
@@ -561,6 +610,12 @@ def baseline_response(connection, observation):
     }
 
 
+
+
+
+
+
+
 def create_app(database_path=DATABASE_PATH, detector=None):
     app = Flask(__name__)
     app.config["DATABASE_PATH"] = str(database_path)
@@ -570,6 +625,13 @@ def create_app(database_path=DATABASE_PATH, detector=None):
     app.config["TRACKERS"] = {}
     app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES * 2
     initialize_database(app.config["DATABASE_PATH"])
+
+    # Enable INFO-level logging so YOLO detection debug lines appear in the console
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     def get_detector():
         if app.config["DETECTOR"] is not None:
@@ -1143,6 +1205,63 @@ def create_app(database_path=DATABASE_PATH, detector=None):
             connection.close()
 
         return jsonify({"baseline": response}), 201
+
+    @app.get("/api/rooms")
+    def list_rooms():
+        with closing(connect_database(app.config["DATABASE_PATH"])) as connection:
+            rows = connection.execute(
+                """
+                SELECT o.room_name, o.room_key, o.captured_at,
+                       COUNT(d.id) AS detection_count
+                FROM observations o
+                LEFT JOIN detections d ON d.observation_id = o.id
+                WHERE o.is_baseline = 1
+                GROUP BY o.room_key
+                ORDER BY o.room_name COLLATE NOCASE
+                """
+            ).fetchall()
+        return jsonify({
+            "rooms": [
+                {
+                    "room_name": row["room_name"],
+                    "room_key": row["room_key"],
+                    "captured_at": row["captured_at"],
+                    "detection_count": row["detection_count"],
+                }
+                for row in rows
+            ]
+        })
+
+    @app.get("/api/comparison")
+    def get_comparison():
+        name = request.args.get("room_name", "Living room").strip()
+        if not name or len(name) > 80:
+            return jsonify({"error": "Room name must contain 1 to 80 characters."}), 400
+        with closing(connect_database(app.config["DATABASE_PATH"])) as connection:
+            observation = connection.execute(
+                """
+                SELECT * FROM observations
+                WHERE room_key = ? AND camera_id = ? AND is_baseline = 1
+                """,
+                (room_key(name), CAMERA_ID),
+            ).fetchone()
+            baseline = baseline_response(connection, observation) if observation else None
+            row = connection.execute(
+                "SELECT * FROM latest_observations WHERE room_key = ?",
+                (room_key(name),),
+            ).fetchone()
+            latest = None
+            if row:
+                latest = {
+                    "room_name": row["room_name"],
+                    "captured_at": row["captured_at"],
+                    "image_data_url": "data:image/jpeg;base64,"
+                    + base64.b64encode(row["image"]).decode("ascii"),
+                    "image_width": row["image_width"],
+                    "image_height": row["image_height"],
+                    "detections": json.loads(row["detections_json"]),
+                }
+        return jsonify({"baseline": baseline, "latest": latest})
 
     return app
 
