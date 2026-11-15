@@ -6,8 +6,8 @@ from ultralytics import YOLO
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 MODEL_OUTPUTS = {
-    "YOLO11n": ROOT_DIR / "yolo11n.pt",
-    "YOLO11s": ROOT_DIR / "yolo11s.pt",
+    "yolo11n": ROOT_DIR / "yolo11n.pt",
+    "yolo11s": ROOT_DIR / "yolo11s.pt",
 }
 IMAGE_DIR = ROOT_DIR / "scratch_eval_images"
 OUTPUT_DIR = Path(__file__).resolve().parent / "evaluation_output"
