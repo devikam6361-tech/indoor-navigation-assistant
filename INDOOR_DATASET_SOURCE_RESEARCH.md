@@ -1,7 +1,7 @@
 # Indoor Dataset Source Research
 
-**Phase:** P6-2 — Indoor Dataset Source Research  
-**Basis:** Approved [P6-1 dataset specification](./INDOOR_DATASET_SPECIFICATION.md)  
+**Phase:** P6-2 — Indoor Dataset Source Research
+**Basis:** Approved [P6-1 dataset specification](./INDOOR_DATASET_SPECIFICATION.md)
 **Scope:** Source verification only. No images or datasets were downloaded.
 
 ## Executive summary
@@ -75,7 +75,11 @@ research is not legal advice.
 - **YOLO suitability:** **Technically suitable after filtering and conversion.**
   Strongest public candidate for door, stairs, footwear, and box annotations.
   Filter for actual indoor scenes, retain attribution/license records, and add
-  cable examples from a separately cleared source.
+  cable examples from a separately cleared source. The official box CSV exposes
+  `IsDepiction` and `IsGroupOf` flags; review them per class against the P6-1
+  annotation rules, and exclude or re-annotate cases that conflict with those
+  rules. Review truncation and occlusion flags against the P6-1 visibility
+  threshold.
 
 ### 2. COCO 2017
 
@@ -105,16 +109,22 @@ research is not legal advice.
 
 ### 3. Objects365
 
-- **Classes:** **Taxonomy verified against the published V1/V2 class mappings
-  in the [MMDetection Objects365 adapter](https://github.com/open-mmlab/mmdetection/blob/main/mmdet/datasets/objects365.py);
-  this mapping is a technical cross-reference, not the dataset's license.**
+- **Classes:** **Class names verified against the V1/V2 class tuples in the
+  third-party [MMDetection Objects365 adapter](https://github.com/open-mmlab/mmdetection/blob/cfd5d3a985b0249de009b67d04f37263e11cdf3d/mmdet/datasets/objects365.py);
+  this is a technical cross-reference, not an official publisher taxonomy or
+  the dataset's license.**
   It includes labels/equivalents such as person, chair, couch, bed,
   cabinet/shelf, refrigerator, microwave, sink, toilet, potted plant,
-  backpack, handbag/satchel, suitcase/luggage, bottle (V1), dining/coffee/side
-  table, storage box, and multiple shoe types. The reviewed taxonomy does not
-  contain dedicated door or stairs categories. `Extension cord` is not
-  equivalent to P6-1's general loose `cable` class. Per-class image counts and
-  indoor subset counts are unverified.
+  backpack, handbag/satchel, suitcase (V1)/luggage (V2, broader candidate),
+  bottle (V1 and V2),
+  dining/coffee/side table, storage box, and multiple shoe types. The reviewed
+  taxonomy does not contain dedicated door or stairs categories. The V2
+  adapter's literal category string is `Dinning Table` (sic); V1 has
+  `dining table`. The spelling in the V2 adapter appears to be a typo, but the
+  publisher's intended spelling was not independently confirmed. This is only
+  a source-label note; the P6-1 class remains ID 4, `table`. `Extension cord`
+  is not equivalent to P6-1's general loose `cable` class. Per-class image
+  counts and indoor subset counts are unverified.
 - **Image count:** **Approximate, official overview:** about 2M images and
   30M bounding boxes across 365 categories.
 - **Annotation format/quality:** **Verified:** object detection boxes with
@@ -123,10 +133,14 @@ research is not legal advice.
   P6-1 need manual checks.
 - **License/commercial use:** **Verified restriction:** the official
   [download terms](https://www.objects365.org/download.html) state academic
-  purposes only. The consortium says it does not own image copyrights, assigns
-  responsibility to users, and restricts user redistribution of images.
-  **Commercial-use status: not permitted under the published academic-only
-  terms absent separate written permission.**
+  purposes only. The same page says the consortium does not own image
+  copyrights, places responsibility on users, and prohibits redistribution of
+  images. It separately licenses the annotations and website under CC BY 4.0
+  and the provided software under MIT; neither license grants rights to the
+  images. **Do not use for commercial training under the published
+  academic-only terms.** The terms page does not document a waiver process;
+  any separate authorization would have to be obtained from the relevant
+  rights holder and verified independently.
 - **YOLO suitability:** **Technically suitable for noncommercial research**
   after conversion and audit. Not recommended for commercial fine-tuning under
   the published terms.
@@ -240,7 +254,7 @@ because exact P6-1 image-level coverage was not verified.
 | `chair` | `chair` | `Chair` | `Chair` | `chair` |
 | `couch` | `couch` | `Couch` | `couch` | `sofa` |
 | `bed` | `bed` | `Bed` | `Bed` | `bed` |
-| `table` | Candidate: `dining table` | `Table`, `Coffee table`, `Kitchen & dining room table` | `Dining Table`, `Coffee Table`, `Side Table` | `table` |
+| `table` | Candidate: `dining table` | `Table`, `Coffee table`, `Kitchen & dining room table` | `dining table` (V1), `Dinning Table` (V2, sic), `Coffee Table`, `Side Table` | `table` |
 | `door` | — | `Door` | — | `door` |
 | `stairs` | — | `Stairs` | — | — |
 | `cabinet` | — | Candidate: `Cabinetry` | Candidate: `Cabinet/shelf` | `cabinet` |
@@ -251,14 +265,58 @@ because exact P6-1 image-level coverage was not verified.
 | `potted plant` | `potted plant` | Candidate: `Houseplant` | `Potted Plant` | — |
 | `backpack` | `backpack` | `Backpack` | `Backpack` | Candidate: `bag` |
 | `handbag` | `handbag` | `Handbag` | `Handbag/Satchel` | Candidate: `bag` |
-| `suitcase` | `suitcase` | `Suitcase` | `Suitcase` (V1), `Luggage` (V2) | Candidate: `bag` |
-| `bottle` | `bottle` | `Bottle` | `Bottle` (V1) | — |
+| `suitcase` | `suitcase` | `Suitcase` | `Suitcase` (V1), candidate: broader `Luggage` (V2) | Candidate: `bag` |
+| `bottle` | `bottle` | `Bottle` | `Bottle` (V1 and V2) | — |
 | `footwear` | — | `Footwear` | Candidate: multiple shoe/boot/slipper/sandal classes | — |
 | `box` | — | `Box` | Candidate: `Storage box` | `box` |
 | `cable` | — | — | —; `Extension cord` is not equivalent to every loose cable | — |
 
 This crosswalk proves category-name availability, not image-level instance
 counts, indoor-scene prevalence, label completeness, or licensing.
+
+### P6-1 boundary compatibility
+
+The P6-1 definitions are the labeling contract. Dataset category names are
+evidence of taxonomy coverage, not proof that the source annotators used the
+same box boundaries or instance grouping. The reviewed official taxonomy and
+annotation summaries do not provide enough per-class instructions to confirm
+these four mappings:
+
+| P6-1 class | P6-1 boundary | Source label(s) | Boundary status |
+|---|---|---|---|
+| `table` (ID 4) | Dining, coffee, side, or end table; exclude counters, desks, shelves, and cabinets. | COCO `dining table`; Open Images `Table`, `Coffee table`, `Kitchen & dining room table`; Objects365 dining/coffee/side table labels; SUN RGB-D `table`. | **UNVERIFIED** — source label coverage is promising, but the combined labels do not establish inclusion/exclusion or per-instance consistency for the P6-1 definition. |
+| `door` (ID 5) | Doorway assembly including visible frame and door leaf/leaves; include open doors; exclude bare openings without an identifiable frame or door. | Open Images `Door`; SUN RGB-D `door`. | **UNVERIFIED** — the source taxonomy does not specify whether a box covers the door leaf, frame, or assembly. |
+| `stairs` (ID 6) | One continuous flight with visible treads/risers and attached handrails; landing-separated flights are distinct. | Open Images `Stairs`. | **UNVERIFIED** — the category name does not establish whether source boxes group flights, landings, and handrails as P6-1 requires. |
+| `cabinet` (ID 7) | One distinct cabinet or continuous built-in cabinet bank; do not split doors, drawers, or handles. | Open Images `Cabinetry`; Objects365 `Cabinet/shelf`; SUN RGB-D `cabinet`. | **UNVERIFIED** — these source labels can represent different aggregation levels; exact instance boundaries are not established. |
+
+Until reviewed sample annotations or class-specific instructions establish
+equivalence, these labels must remain candidate inputs for manual remapping or
+re-annotation, not automatic P6-1 labels.
+
+## Licensing layers and commercial-use status
+
+Image rights, annotation rights, and software licenses are separate. A license
+for an API, downloader, or annotation file does not grant rights to the
+underlying images. “Unverified” means no permission should be inferred.
+
+| Source | Image rights | Annotation/data rights | Software license | Commercial-use status |
+|---|---|---|---|---|
+| Open Images V7 | Official facts page lists images as CC BY 2.0, but disclaims image-level warranties; verify each image and attribution. | Official facts page: annotations CC BY 4.0. | The separate [Open Images dataset repository license](https://github.com/openimages/dataset/blob/master/LICENSE) is Apache 2.0 for repository software; it does not replace dataset/image terms. | **Conditional, not blanket-cleared:** only use images whose actual license and attribution requirements are verified. |
+| COCO 2017 | **Unverified:** image-source and current dataset terms were not confirmed in this review. | **Unverified:** no separate annotation-data grant was confirmed; the official terms endpoint was inaccessible. | [COCO API code](https://github.com/cocodataset/cocoapi/blob/master/license.txt) is under BSD-style terms; that is a software license only. | **Unverified:** do not claim commercial image or annotation clearance until official terms and source-image rights are checked. |
+| Objects365 | Official terms say the consortium does not own image copyright, images are subject to source terms, users bear responsibility, and image redistribution is prohibited. | Official terms license annotations and website under CC BY 4.0. | Official terms provide the software under MIT; this does not license images. | **Academic purposes only** under the published terms; not recommended for commercial training. No waiver path is stated. |
+| ADE20K | Official README says data access/use is governed by the linked Terms of Use; exact image rights were not verified here. | Governed by the same data terms; exact annotation rights were not verified here. | No repository-root software license was identified in the reviewed repository listing; do not infer a code license. | **Unverified:** no commercial permission asserted. |
+| SUN RGB-D | **Unverified:** no blanket image license or image-level permissions were established. | **Unverified:** the reviewed 37-class metadata reference does not state a data/annotation license. | No separate license file was identified at the reviewed metadata repository root; this is not proof of permission or of no other terms. | **Unverified:** do not use commercially until applicable source and dataset rights are established. |
+| ScanNet | Dataset governed by the ScanNet Terms of Use; the signed terms were not accessible for review. | Dataset annotations/projections are part of the governed data; exact rights and restrictions remain unverified. | The separate [ScanNet repository code license](https://github.com/ScanNet/ScanNet/blob/master/LICENSE) is MIT. | **Unverified:** the data agreement is required; no commercial permission is claimed. |
+| Project-captured images | Must be covered by applicable photographer, property, and participant permissions. | Project annotation rights depend on the capture/annotation agreements. | No dataset software license is involved unless separate tooling is used. | **Conditional on documented rights and consent; no automatic clearance.** |
+
+Official evidence: [Open Images facts and license](https://storage.googleapis.com/openimages/web/factsfigures_v7.html);
+[COCO terms](https://cocodataset.org/#termsofuse) and [API license](https://github.com/cocodataset/cocoapi/blob/master/license.txt);
+[Objects365 terms](https://www.objects365.org/download.html);
+[ADE20K README](https://github.com/CSAILVision/ADE20K/blob/main/README.md) and [terms](https://ade20k.csail.mit.edu/terms);
+[SUN RGB-D metadata reference](https://github.com/ankurhanda/sunrgbd-meta-data);
+and [ScanNet README/terms notice](https://github.com/ScanNet/ScanNet/blob/master/README.md).
+Links to inaccessible terms pages are retained as authoritative review targets,
+not as evidence of permission.
 
 ## Recommendations and unresolved gaps
 
@@ -313,7 +371,7 @@ counts, indoor-scene prevalence, label completeness, or licensing.
   [COCO API code license](https://github.com/cocodataset/cocoapi/blob/master/license.txt)
 - Objects365: [official overview](https://www.objects365.org/overview.html),
   [official download terms](https://www.objects365.org/download.html), and
-  [published V1/V2 class mapping in MMDetection](https://github.com/open-mmlab/mmdetection/blob/main/mmdet/datasets/objects365.py)
+  [published V1/V2 class mapping in MMDetection](https://github.com/open-mmlab/mmdetection/blob/cfd5d3a985b0249de009b67d04f37263e11cdf3d/mmdet/datasets/objects365.py)
 - ADE20K: [official repository and dataset description](https://github.com/CSAILVision/ADE20K)
   and [terms of use](https://ade20k.csail.mit.edu/terms)
 - SUN RGB-D: [official project page](https://rgbd.cs.princeton.edu/) and
