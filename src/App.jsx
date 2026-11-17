@@ -1,5 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
+import {
+  compareLayouts,
+  DEFAULT_CAMERA_ID,
+  readJson,
+} from "./utils/apiClient.js";
+import { captureJpegFromVideo } from "./utils/imageCapture.js";
+import {
+  isSpeechSynthesisSupported,
+  speakText,
+  cancelSpeech,
+  unlockSpeechSynthesis,
+  formatAlertAnnouncement,
+  formatComparisonAnnouncement,
+} from "./voice/voiceSynthesis.js";
+import {
+  isSpeechRecognitionSupported,
+  createRecognition,
+} from "./voice/voiceRecognition.js";
+import { formatDate } from "./utils/formatters.js";
+import RoomSelector from "./components/rooms/RoomSelector.jsx";
+import CameraPanel from "./components/camera/CameraPanel.jsx";
+import BaselinePanel from "./components/camera/BaselinePanel.jsx";
+import ComparisonModal from "./components/monitoring/ComparisonModal.jsx";
+import LiveObjects from "./components/monitoring/LiveObjects.jsx";
+import AlertHistory from "./components/alerts/AlertHistory.jsx";
+import FindPanel from "./components/objectFinder/FindPanel.jsx";
+import SavedLayoutsPanel from "./components/layouts/SavedLayoutsPanel.jsx";
 
 const PRESET_ROOMS = ["Bedroom", "Kitchen", "Living room", "Bathroom", "Other"];
 const DEFAULT_ROOM = "Living room";
@@ -7,135 +34,27 @@ const OBSERVATION_INTERVAL_MS = 2500;
 // AbortController timeout for baseline fetches (ms)
 const BASELINE_FETCH_TIMEOUT_MS = 10000;
 
-async function readJson(response) {
-  // Guard against non-JSON responses (e.g. HTML error pages from Flask/proxy)
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.includes("application/json")) {
-    throw new Error(`Server error ${response.status} — check Flask is running at http://127.0.0.1:5000`);
-  }
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || `Request failed (${response.status})`);
-  }
-  return payload;
-}
-
-// Capture a JPEG data-URL from a video element, guaranteed to be JPEG.
-// Uses an offscreen canvas; if the browser produces PNG instead of JPEG,
-// re-encodes via a blob URL (async) to force JPEG.
-async function captureJpegFromVideo(video, quality = 0.82) {
-  const offscreen = document.createElement("canvas");
-  const scale = Math.min(1, 1280 / video.videoWidth, 720 / video.videoHeight);
-  offscreen.width = Math.round(video.videoWidth * scale);
-  offscreen.height = Math.round(video.videoHeight * scale);
-  const ctx = offscreen.getContext("2d");
-  if (!ctx) throw new Error("Could not create canvas context from webcam frame.");
-  ctx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
-  const dataUrl = offscreen.toDataURL("image/jpeg", quality);
-  if (dataUrl.startsWith("data:image/jpeg;base64,")) return dataUrl;
-
-  // Browser produced PNG — convert using a Blob and createObjectURL so the
-  // image is fully decoded before we draw it onto the fallback canvas.
-  return new Promise((resolve, reject) => {
-    offscreen.toBlob((blob) => {
-      if (!blob) { reject(new Error("Canvas toBlob failed.")); return; }
-      const url = URL.createObjectURL(blob);
-      const img = new Image();
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        const fb = document.createElement("canvas");
-        fb.width = offscreen.width;
-        fb.height = offscreen.height;
-        const ctx2 = fb.getContext("2d");
-        ctx2.drawImage(img, 0, 0);
-        const jpeg = fb.toDataURL("image/jpeg", quality);
-        if (!jpeg.startsWith("data:image/jpeg;base64,")) {
-          reject(new Error("Browser cannot produce a JPEG from the webcam. Try Chrome or Edge."));
-        } else {
-          resolve(jpeg);
-        }
-      };
-      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not re-encode webcam frame as JPEG.")); };
-      img.src = url;
-    }, "image/png");
-  });
-}
-
-function formatDate(value) {
-  return new Date(value).toLocaleString();
-}
-
-function objectLabel(object) {
-  return `${object.class_name} ${object.instance_number}`;
-}
-
-// Draw bounding boxes on a canvas over an image
-function DetectionOverlay({ imageUrl, detections, label }) {
-  const canvasRef = useRef(null);
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !imageUrl) return;
-    const img = new Image();
-    img.onload = () => {
-      const ctx = canvas.getContext("2d");
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      ctx.drawImage(img, 0, 0);
-      if (detections && detections.length) {
-        detections.forEach((det) => {
-          const x = det.x1 * img.naturalWidth;
-          const y = det.y1 * img.naturalHeight;
-          const w = (det.x2 - det.x1) * img.naturalWidth;
-          const h = (det.y2 - det.y1) * img.naturalHeight;
-          ctx.strokeStyle = "#2d9c5e";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(x, y, w, h);
-          ctx.fillStyle = "rgba(45,156,94,0.85)";
-          const text = `${det.class_name} ${Math.round(det.confidence * 100)}%`;
-          ctx.font = `bold ${Math.max(11, img.naturalWidth / 60)}px sans-serif`;
-          const tw = ctx.measureText(text).width + 6;
-          ctx.fillRect(x, y - Math.max(16, img.naturalHeight / 35), tw, Math.max(16, img.naturalHeight / 35));
-          ctx.fillStyle = "#fff";
-          ctx.fillText(text, x + 3, y - 3);
-        });
-      }
-    };
-    img.src = imageUrl;
-  }, [imageUrl, detections]);
-  return (
-    <div className="overlay-wrapper">
-      <p className="overlay-label">{label}</p>
-      <canvas
-        ref={canvasRef}
-        className="detection-canvas"
-        aria-label={label}
-        role="img"
-      />
-    </div>
-  );
-}
-
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
+  const cameraStartGenerationRef = useRef(0);
+  const cameraStartInFlightRef = useRef(false);
+  const componentMountedRef = useRef(false);
   const speechSupportedRef = useRef(false);
   const lastCameraStatusRef = useRef("");
+  const captureInFlightRef = useRef(false);
+  const comparisonInFlightRef = useRef(false);
+  const comparisonGenerationRef = useRef(0);
 
   const [roomName, setRoomName] = useState(DEFAULT_ROOM);
   const [customRoomName, setCustomRoomName] = useState("");
   const [isCustomRoom, setIsCustomRoom] = useState(false);
   const [knownRooms, setKnownRooms] = useState([]);
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const [cameraStartCanceled, setCameraStartCanceled] = useState(false);
   const [busy, setBusy] = useState(false);
-
-
-
-
-
-
-
-
 
   const [baseline, setBaseline] = useState(null);
   const [latest, setLatest] = useState(null);
@@ -148,9 +67,17 @@ function App() {
   const [notice, setNotice] = useState("");
   const [showComparison, setShowComparison] = useState(false);
   const [comparison, setComparison] = useState(null);
+  const [beforeLayout, setBeforeLayout] = useState(null);
+  const [afterLayout, setAfterLayout] = useState(null);
   const [activeTab, setActiveTab] = useState("monitor"); // "monitor" | "history" | "find"
   const [backendDown, setBackendDown] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [voiceUnlocked, setVoiceUnlocked] = useState(false);
+  const [lastSpokenAnnouncement, setLastSpokenAnnouncement] = useState("");
+  const [cameraViewStatus, setCameraViewStatus] = useState("stable");
+  const [liveDetections, setLiveDetections] = useState([]);
+  const [liveComparison, setLiveComparison] = useState(null);
 
   const effectiveRoomName = isCustomRoom ? customRoomName.trim() : roomName;
 
@@ -169,12 +96,6 @@ function App() {
     const response = await fetch(`/api/alerts?room_name=${encodeURIComponent(name)}`);
     const result = await readJson(response);
     setHistory(result.history);
-  }, []);
-
-  const loadComparison = useCallback(async (name) => {
-    const response = await fetch(`/api/comparison?room_name=${encodeURIComponent(name)}`);
-    const result = await readJson(response);
-    setComparison(result);
   }, []);
 
   const recordPlayback = useCallback(async (event, status, playbackError) => {
@@ -200,26 +121,74 @@ function App() {
 
   const speakAlert = useCallback(
     (event) => {
-      if (
-        !speechSupportedRef.current ||
-        !("speechSynthesis" in window) ||
-        typeof window.SpeechSynthesisUtterance !== "function"
-      ) {
+      if (!voiceEnabled) return;
+      if (!speechSupportedRef.current || !isSpeechSynthesisSupported()) {
         recordPlayback(event, "unavailable", "Speech playback is unavailable in this browser.");
         return;
       }
-      const utterance = new window.SpeechSynthesisUtterance(event.message);
-      utterance.rate = 0.92;
-      utterance.onend = () => recordPlayback(event, "spoken");
-      utterance.onerror = (speechEvent) => {
-        const reason = speechEvent.error || "Browser speech playback failed.";
-        recordPlayback(event, "failed", reason);
-        setMonitorMessage(`Voice alert could not be played: ${reason}`);
-      };
-      window.speechSynthesis.speak(utterance);
+      const formatted = formatAlertAnnouncement(event);
+      setLastSpokenAnnouncement(formatted);
+      speakText(formatted, {
+        rate: 0.92,
+        onEnd: () => recordPlayback(event, "spoken"),
+        onError: (speechEvent) => {
+          const reason = speechEvent.error || "Browser speech playback failed.";
+          recordPlayback(event, "failed", reason);
+          setMonitorMessage(`Voice alert could not be played: ${reason}`);
+        },
+      });
     },
-    [recordPlayback],
+    [voiceEnabled, recordPlayback],
   );
+
+  const handleReplayVoice = useCallback(
+    (overrideText) => {
+      const text =
+        overrideText ||
+        lastSpokenAnnouncement ||
+        (history.length > 0 ? history[0].message : "No recent alerts to announce.");
+      if (!text) return;
+      unlockSpeechSynthesis();
+      speakText(text, { rate: 0.92 });
+    },
+    [lastSpokenAnnouncement, history],
+  );
+
+  const handleToggleVoice = useCallback(() => {
+    setVoiceEnabled((prev) => {
+      const next = !prev;
+      if (!next) {
+        cancelSpeech();
+      } else {
+        unlockSpeechSynthesis();
+        speakText("Voice alerts enabled.", { rate: 0.92 });
+      }
+      return next;
+    });
+  }, []);
+
+  const handleInitializeVoice = useCallback(() => {
+    const success = unlockSpeechSynthesis();
+    if (success) {
+      setVoiceUnlocked(true);
+      speakText("Voice alerts initialized and active.", { rate: 0.92 });
+      setNotice("Voice alerts initialized. Chrome audio playback permissions unlocked.");
+    }
+  }, []);
+
+  const handleTestVoice = useCallback(() => {
+    unlockSpeechSynthesis();
+    setVoiceUnlocked(true);
+    const testMsg = "Voice alert test successful. Speech synthesis is active.";
+    setLastSpokenAnnouncement(testMsg);
+    speakText(testMsg, { rate: 0.92 });
+    setNotice("Voice test played. Speech synthesis is active.");
+  }, []);
+
+  const handleRestoreView = useCallback(() => {
+    setNotice("Align your camera with the original learned viewpoint. Re-verifying camera stability...");
+    setCameraViewStatus("stable");
+  }, []);
 
   // Load baseline whenever the effective room name changes or a retry is triggered.
   // AbortController cancels in-flight requests when the room changes so stale
@@ -272,22 +241,6 @@ function App() {
     };
   }, [effectiveRoomName, retryCount]);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
   // Load rooms list on mount — inlined so the linter can see setState is
   // only called inside an async callback, not synchronously in the effect body.
   useEffect(() => {
@@ -298,13 +251,19 @@ function App() {
   }, []);
 
   // Cleanup on unmount
-  useEffect(
-    () => () => {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    },
-    [],
-  );
+  useEffect(() => {
+    componentMountedRef.current = true;
+    const video = videoRef.current;
+    return () => {
+      componentMountedRef.current = false;
+      cameraStartGenerationRef.current += 1;
+      const stream = streamRef.current;
+      streamRef.current = null;
+      stream?.getTracks().forEach((track) => track.stop());
+      if (video?.srcObject === stream) video.srcObject = null;
+      cancelSpeech();
+    };
+  }, []);
 
   // Monitoring loop
   useEffect(() => {
@@ -341,12 +300,30 @@ function App() {
         if (result.status !== lastCameraStatusRef.current) {
           lastCameraStatusRef.current = result.status;
           if (result.status === "camera_moved") {
+            setCameraViewStatus("moved");
             setMonitorMessage("Camera view changed. Alerts are paused until you restore the learned viewpoint or relearn this room.");
+            if (voiceEnabled) {
+              speakText("Warning! The camera has moved. Room change alerts are paused until you restore the viewpoint.", { rate: 0.92 });
+            }
           } else if (result.status === "view_unverified") {
+            setCameraViewStatus("unknown");
             setMonitorMessage("Camera view could not be verified. Changes are not being announced to avoid false alerts.");
+            if (voiceEnabled) {
+              speakText("Camera view cannot be verified due to viewpoint or lighting changes. Monitoring is paused.", { rate: 0.92 });
+            }
           } else {
-            setMonitorMessage("Monitoring this camera view for confirmed changes. Alerts require repeated detections.");
+            setCameraViewStatus("stable");
+            setMonitorMessage("Monitoring this camera view for confirmed changes. Room is stable.");
           }
+        }
+
+        if (result.live_detections) {
+          setLiveDetections(result.live_detections);
+        } else if (result.latest?.detections) {
+          setLiveDetections(result.latest.detections);
+        }
+        if (result.comparison) {
+          setLiveComparison(result.comparison);
         }
 
         if (result.latest) setLatest(result.latest);
@@ -367,9 +344,11 @@ function App() {
       window.clearInterval(timer);
       controller.abort();
     };
-  }, [baseline, cameraActive, effectiveRoomName, speakAlert]);
+  }, [baseline, cameraActive, effectiveRoomName, speakAlert, voiceEnabled]);
 
   async function startCamera() {
+    if (cameraStartInFlightRef.current || streamRef.current) return;
+
     setError("");
     setNotice("");
 
@@ -378,10 +357,19 @@ function App() {
       return;
     }
 
+    cameraStartInFlightRef.current = true;
+    const requestGeneration = ++cameraStartGenerationRef.current;
+    setCameraStarting(true);
+    setCameraStartCanceled(false);
     setMonitorMessage("Requesting camera permission…");
     let stream = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+      if (requestGeneration !== cameraStartGenerationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       streamRef.current = stream;
       const video = videoRef.current;
       video.srcObject = stream;
@@ -428,8 +416,14 @@ function App() {
         }
       });
 
-      speechSupportedRef.current =
-        "speechSynthesis" in window && typeof window.SpeechSynthesisUtterance === "function";
+      if (requestGeneration !== cameraStartGenerationRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (streamRef.current === stream) streamRef.current = null;
+        if (video.srcObject === stream) video.srcObject = null;
+        return;
+      }
+
+      speechSupportedRef.current = isSpeechSynthesisSupported();
       lastCameraStatusRef.current = "";
       setMonitorMessage(
         hasCurrentRoomBaseline && baseline && baseline.detections.length
@@ -441,9 +435,14 @@ function App() {
       // Stop any tracks that were acquired before the failure
       if (stream) {
         stream.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-        if (videoRef.current) videoRef.current.srcObject = null;
+        if (streamRef.current === stream) streamRef.current = null;
+        if (videoRef.current?.srcObject === stream) videoRef.current.srcObject = null;
       }
+      if (
+        requestGeneration !== cameraStartGenerationRef.current
+        || !componentMountedRef.current
+      ) return;
+
       setMonitorMessage("");
       const ename = cameraError.name;
       if (ename === "NotAllowedError" || ename === "PermissionDeniedError") {
@@ -455,18 +454,35 @@ function App() {
       } else {
         setError(`Could not start the webcam: ${cameraError.message}`);
       }
+    } finally {
+      cameraStartInFlightRef.current = false;
+      if (componentMountedRef.current) {
+        setCameraStarting(false);
+        setCameraStartCanceled(false);
+      }
     }
   }
 
   function stopCamera() {
+    const startupPending = cameraStartInFlightRef.current;
+    cameraStartGenerationRef.current += 1;
+    if (startupPending) setCameraStartCanceled(true);
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
     setCameraActive(false);
-    setMonitorMessage("Monitoring is stopped.");
+    setLiveDetections([]);
+    setLiveComparison(null);
+    setMonitorMessage(
+      startupPending
+        ? "Camera startup canceled. Waiting for the permission request to finish."
+        : "Monitoring is stopped."
+    );
   }
 
   async function captureLayout(replace = false) {
+    if (captureInFlightRef.current) return;
+
     const name = effectiveRoomName;
     const video = videoRef.current;
 
@@ -479,12 +495,14 @@ function App() {
       return;
     }
 
-    if (replace && !window.confirm(`Replace the saved layout for "${name}"? This cannot be undone.`)) return;
-
-    setBusy(true);
-    setError("");
-    setNotice("");
+    captureInFlightRef.current = true;
     try {
+      if (replace && !window.confirm(`Replace the saved layout for "${name}"? This cannot be undone.`)) return;
+
+      setBusy(true);
+      setError("");
+      setNotice("");
+
       // Capture a guaranteed JPEG frame from the live video feed (async)
       let imageDataUrl;
       try {
@@ -495,24 +513,6 @@ function App() {
 
       setNotice("Sending image to server for YOLO detection…");
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
       const response = await fetch("/api/baseline", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -522,7 +522,9 @@ function App() {
       const result = await readJson(response);
       setBaseline(result.baseline);
       setLatest(null);
+      invalidateSavedComparisonRequest();
       setComparison(null);
+      setShowComparison(false);
       setMonitorMessage("Original layout saved. Start monitoring to detect changes.");
       setNotice(
         result.baseline.detections.length
@@ -537,6 +539,7 @@ function App() {
     } catch (saveError) {
       setError(`Could not save layout: ${saveError.message}`);
     } finally {
+      captureInFlightRef.current = false;
       setBusy(false);
     }
   }
@@ -546,13 +549,13 @@ function App() {
       setNotice("There are no change alerts to repeat.");
       return;
     }
-    if (!("speechSynthesis" in window)) {
+    if (!isSpeechSynthesisSupported()) {
       setError("Speech playback is unavailable in this browser.");
       return;
     }
     const report = history.slice(0, 5).map((event) => event.message).join(" ");
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(new window.SpeechSynthesisUtterance(report));
+    cancelSpeech();
+    speakText(report);
   }
 
   async function findObject(query = findQuery) {
@@ -569,30 +572,24 @@ function App() {
       );
       const result = await readJson(response);
       setFindResult(result.message);
-      if ("speechSynthesis" in window) {
-        const utterance = new window.SpeechSynthesisUtterance(result.message);
-        utterance.onerror = (speechEvent) => {
+      speakText(result.message, {
+        onError: (speechEvent) => {
           const reason = speechEvent.error || "Browser speech playback failed.";
           setMonitorMessage(`Object-finding voice response could not be played: ${reason}`);
-        };
-        window.speechSynthesis.speak(utterance);
-      }
+        },
+      });
     } catch (findError) {
       setError(findError.message);
     }
   }
 
   function startVoiceSearch() {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
+    if (!isSpeechRecognitionSupported()) {
       setError("Voice recognition is unavailable in this browser. Enter an object name instead.");
       return;
     }
     setError("");
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = false;
+    const recognition = createRecognition("en-US");
     recognition.onresult = (event) => {
       const spokenQuery = event.results[0][0].transcript;
       setFindQuery(spokenQuery);
@@ -609,17 +606,148 @@ function App() {
   }
 
 
+  function invalidateSavedComparisonRequest() {
+    comparisonGenerationRef.current += 1;
+    comparisonInFlightRef.current = false;
+  }
+
+  function resetSavedComparison() {
+    invalidateSavedComparisonRequest();
+    setBeforeLayout(null);
+    setAfterLayout(null);
+    setComparison(null);
+    setShowComparison(false);
+  }
+
+  function handleComparisonLayoutSaved(stage, layout) {
+    invalidateSavedComparisonRequest();
+    if (stage === "before") {
+      setBeforeLayout(layout);
+      setAfterLayout(null);
+    } else {
+      setAfterLayout(layout);
+    }
+    setComparison(null);
+    setShowComparison(false);
+  }
+
   async function handleShowComparison() {
     const name = effectiveRoomName;
-    if (!name) return;
-    await loadComparison(name);
+    const pairIsInScope =
+      beforeLayout
+      && afterLayout
+      && beforeLayout.room_name.toLowerCase() === name.toLowerCase()
+      && afterLayout.room_name.toLowerCase() === name.toLowerCase()
+      && beforeLayout.camera_id === DEFAULT_CAMERA_ID
+      && afterLayout.camera_id === DEFAULT_CAMERA_ID;
+    if (!pairIsInScope || comparisonInFlightRef.current) return;
+
+    comparisonInFlightRef.current = true;
+    const requestGeneration = comparisonGenerationRef.current;
+    setError("");
+    setComparison({ status: "loading", before: beforeLayout, after: afterLayout });
     setShowComparison(true);
+    try {
+      const result = await compareLayouts({
+        roomName: name,
+        cameraId: DEFAULT_CAMERA_ID,
+        beforeLayoutId: beforeLayout.id,
+        afterLayoutId: afterLayout.id,
+      });
+      if (requestGeneration !== comparisonGenerationRef.current) return;
+      if (!["changed", "unchanged", "uncertain"].includes(result.status)) {
+        throw new Error("The comparison service returned an unsupported result.");
+      }
+      setComparison(result);
+      const announcement = formatComparisonAnnouncement(result, name);
+      setLastSpokenAnnouncement(announcement);
+      if (voiceEnabled) {
+        if (!isSpeechSynthesisSupported()) {
+          setComparison((current) => ({
+            ...current,
+            speechWarning: "Comparison complete, but speech playback is unavailable in this browser.",
+          }));
+        } else {
+          try {
+            speakText(announcement, {
+              rate: 0.92,
+              onError: (speechEvent) => {
+                const reason = speechEvent.error || "Browser speech playback failed.";
+                setComparison((current) => current && ({
+                  ...current,
+                  speechWarning: `Voice alert could not be played: ${reason}. Use Replay Voice to hear it.`,
+                }));
+              },
+            });
+          } catch (speechError) {
+            setComparison((current) => current && ({
+              ...current,
+              speechWarning: `Voice alert could not be played: ${speechError.message}`,
+            }));
+          }
+        }
+      }
+    } catch (comparisonError) {
+      if (requestGeneration !== comparisonGenerationRef.current) return;
+      setComparison({
+        status: "error",
+        error: comparisonError.message,
+        before: beforeLayout,
+        after: afterLayout,
+      });
+    } finally {
+      if (requestGeneration === comparisonGenerationRef.current) {
+        comparisonInFlightRef.current = false;
+      }
+    }
+  }
+
+  function handleLayoutSaved(layout) {
+    invalidateSavedComparisonRequest();
+    setBaseline(layout);
+    setLatest(null);
+    setComparison(null);
+    setShowComparison(false);
+    setMonitorMessage(
+      cameraActive
+        ? "New layout saved and active. Monitoring remains on while the camera view is revalidated."
+        : "New layout saved and active. Monitoring remains stopped until you start it.",
+    );
+    void loadKnownRooms();
+  }
+
+  function handleLayoutActivated(layout) {
+    invalidateSavedComparisonRequest();
+    setBaseline(layout);
+    setLatest(null);
+    setComparison(null);
+    setShowComparison(false);
+    setMonitorMessage(
+      cameraActive
+        ? "Saved layout restored. Monitoring remains on while the camera view is revalidated."
+        : "Saved layout restored. Monitoring remains stopped; start it when you are ready.",
+    );
   }
 
   const hasCurrentRoomBaseline =
     baseline && baseline.room_name.toLowerCase() === effectiveRoomName.toLowerCase();
+  const canCompareSavedLayouts =
+    beforeLayout
+    && afterLayout
+    && beforeLayout.room_name.toLowerCase() === effectiveRoomName.toLowerCase()
+    && afterLayout.room_name.toLowerCase() === effectiveRoomName.toLowerCase()
+    && beforeLayout.camera_id === DEFAULT_CAMERA_ID
+    && afterLayout.camera_id === DEFAULT_CAMERA_ID;
 
   const knownObjectNames = new Set((baseline?.detections || []).map((item) => item.class_name));
+
+  const monitoringState = !cameraActive
+    ? "idle"
+    : cameraViewStatus === "moved"
+    ? "moved"
+    : cameraViewStatus === "unknown"
+    ? "paused"
+    : "active";
 
   return (
     <main className="app-shell" role="main">
@@ -650,295 +778,121 @@ function App() {
       )}
 
       {/* ── ROOM SELECTOR ── */}
-      <section className="room-selector-section" aria-label="Room selection">
-        <div className="room-selector-card">
-          <h2 className="room-selector-heading">
-            <span aria-hidden="true">🏠</span> Select Room
-          </h2>
-          <div className="room-pills" role="group" aria-label="Preset rooms">
-            {PRESET_ROOMS.map((room) => (
-              <button
-                key={room}
-                className={`room-pill ${!isCustomRoom && roomName === room ? "room-pill-active" : ""}`}
-                onClick={() => {
-                  if (roomName === room && !isCustomRoom) return; // already selected
-                  if (cameraActive) stopCamera();
-                  setIsCustomRoom(false);
-                  setRoomName(room);
-                  setError("");
-                  setFindResult("");
-                  setBaselineLoading(true);
-                }}
-                aria-pressed={!isCustomRoom && roomName === room}
-                aria-label={`Select ${room}`}
-              >
-                {room}
-              </button>
-            ))}
-            <button
-              className={`room-pill ${isCustomRoom ? "room-pill-active" : ""}`}
-              onClick={() => {
-                if (cameraActive) stopCamera();
-                setIsCustomRoom(true);
-                setError("");
-                setFindResult("");
-                setBaselineLoading(true);
-              }}
-              aria-pressed={isCustomRoom}
-              aria-label="Enter custom room name"
-            >
-              Custom
-            </button>
-          </div>
-          {isCustomRoom && (
-            <label className="room-field custom-room-field">
-              <span>Custom room name</span>
-              <input
-                aria-label="Enter custom room name"
-                maxLength={80}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  if (next === customRoomName) return;
-                  setCustomRoomName(next);
-                  setError("");
-                  setFindResult("");
-                  setBaselineLoading(true);
-                }}
-                placeholder="e.g. Study, Garage..."
-                value={customRoomName}
-                autoFocus
-              />
-            </label>
-          )}
-          {knownRooms.length > 0 && (
-            <p className="known-rooms-note" aria-live="polite">
-              Rooms with saved layouts:{" "}
-              {knownRooms.map((r) => (
-                <button
-                  key={r.room_key}
-                  className="known-room-link"
-                  onClick={() => {
-                    if (cameraActive) stopCamera();
-                    setIsCustomRoom(false);
-                    const match = PRESET_ROOMS.find(
-                      (p) => p.toLowerCase() === r.room_name.toLowerCase()
-                    );
-                    if (match) {
-                      setRoomName(match);
-                    } else {
-                      setIsCustomRoom(true);
-                      setCustomRoomName(r.room_name);
-                    }
-                    setError("");
-                    setFindResult("");
-                    setBaselineLoading(true);
-                  }}
-                  aria-label={`Switch to ${r.room_name} (${r.detection_count} objects)`}
-                >
-                  {r.room_name} ({r.detection_count})
-                </button>
-              ))}
-            </p>
-          )}
-        </div>
-      </section>
+      <RoomSelector
+        presetRooms={PRESET_ROOMS}
+        roomName={roomName}
+        isCustomRoom={isCustomRoom}
+        customRoomName={customRoomName}
+        knownRooms={knownRooms}
+        onPresetSelect={(room) => {
+          if (roomName === room && !isCustomRoom) return;
+          if (cameraActive || cameraStartInFlightRef.current) stopCamera();
+          resetSavedComparison();
+          setIsCustomRoom(false);
+          setRoomName(room);
+          setError("");
+          setFindResult("");
+          setBaselineLoading(true);
+        }}
+        onCustomToggle={() => {
+          if (cameraActive || cameraStartInFlightRef.current) stopCamera();
+          resetSavedComparison();
+          setIsCustomRoom(true);
+          setError("");
+          setFindResult("");
+          setBaselineLoading(true);
+        }}
+        onCustomNameChange={(name) => {
+          if (cameraStartInFlightRef.current) stopCamera();
+          resetSavedComparison();
+          setCustomRoomName(name);
+          setError("");
+          setFindResult("");
+          setBaselineLoading(true);
+        }}
+        onKnownRoomSelect={(r) => {
+          if (cameraActive || cameraStartInFlightRef.current) stopCamera();
+          resetSavedComparison();
+          setIsCustomRoom(false);
+          const match = PRESET_ROOMS.find(
+            (p) => p.toLowerCase() === r.room_name.toLowerCase()
+          );
+          if (match) {
+            setRoomName(match);
+          } else {
+            setIsCustomRoom(true);
+            setCustomRoomName(r.room_name);
+          }
+          setError("");
+          setFindResult("");
+          setBaselineLoading(true);
+        }}
+      />
 
       {/* ── CAMERA + LAYOUT CAPTURE ── */}
       <section className="learning-grid" aria-label="Room layout and camera">
-        <div className="panel camera-panel">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">LIVE CAMERA</p>
-              <h2 id="camera-heading">
-                {effectiveRoomName || "Select a room"} — Camera
-              </h2>
-            </div>
-            <span className={`status-pill ${cameraActive ? "is-live" : ""}`} aria-live="polite">
-              <span aria-hidden="true" className="status-dot" />
-              {cameraActive ? (baseline?.detections.length ? "Monitoring" : "Camera on") : "Camera off"}
-            </span>
-          </div>
-
-          <div className="camera-frame" aria-label="Camera preview">
-            <video ref={videoRef} autoPlay muted playsInline aria-label="Live webcam feed" />
-            {!cameraActive && (
-              <div className="camera-placeholder" role="img" aria-label="Camera is off">
-                <span className="camera-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M4 7h3l1.5-2h7L17 7h3v12H4z" />
-                    <circle cx="12" cy="13" r="4" />
-                  </svg>
-                </span>
-                <p>Start the webcam to preview and monitor this room</p>
-                <p className="camera-hint">Keep the camera fixed in its learned position.</p>
-              </div>
-            )}
-          </div>
-
-          <div className="camera-controls" aria-label="Camera and layout controls">
-            <div className="button-row">
-              {!cameraActive ? (
-                <button
-                  className="button button-secondary"
-                  disabled={baselineLoading}
-                  onClick={startCamera}
-                  aria-label="Start monitoring camera"
-                >
-                  {baseline?.detections.length ? "▶ Start Monitoring" : "▶ Start Webcam"}
-                </button>
-              ) : (
-                <button
-                  className="button button-secondary"
-                  onClick={stopCamera}
-                  aria-label="Stop monitoring camera"
-                >
-                  ⏹ Stop {baseline?.detections.length ? "Monitoring" : "Camera"}
-                </button>
-              )}
-
-              <button
-                className="button button-primary"
-                disabled={!cameraActive || busy || !effectiveRoomName || hasCurrentRoomBaseline}
-                onClick={() => captureLayout(false)}
-                aria-label="Capture original room layout"
-              >
-                {busy ? "Saving layout..." : hasCurrentRoomBaseline ? "✓ Layout Saved" : "📷 Capture Original Layout"}
-              </button>
-            </div>
-
-            {cameraActive && hasCurrentRoomBaseline && (
-              <button
-                className="relearn-button"
-                disabled={busy}
-                onClick={() => captureLayout(true)}
-                aria-label="Replace saved layout with current view"
-              >
-                🔄 Re-capture layout (replaces saved baseline)
-              </button>
-            )}
-
-            {hasCurrentRoomBaseline && latest && (
-              <button
-                className="compare-button"
-                onClick={handleShowComparison}
-                aria-label="View before and after comparison"
-              >
-                🔍 View Before &amp; After Comparison
-              </button>
-            )}
-          </div>
-          <canvas className="capture-canvas" ref={canvasRef} aria-hidden="true" />
-        </div>
-
-        {/* ── BASELINE / ORIGINAL LAYOUT ── */}
-        <section className="panel memory-panel" aria-live="polite" aria-label="Saved original layout">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">ORIGINAL LAYOUT</p>
-              <h2>Saved arrangement</h2>
-            </div>
-            {hasCurrentRoomBaseline && <span className="saved-badge" aria-label="Layout saved">✓ Saved</span>}
-          </div>
-
-          {baselineLoading ? (
-            <p className="empty-state" aria-live="polite">Loading saved room memory...</p>
-          ) : hasCurrentRoomBaseline ? (
-            <>
-              <img
-                alt={`Saved camera view of ${baseline.room_name}`}
-                className="baseline-image"
-                src={baseline.image_data_url}
-              />
-              <p className="saved-meta">
-                {baseline.room_name} | Captured {formatDate(baseline.captured_at)}
-              </p>
-              <p className="detection-count">
-                {baseline.detections.length} object{baseline.detections.length === 1 ? "" : "s"} recorded
-              </p>
-              {baseline.detections.length ? (
-                <ul className="object-list" aria-label="Detected objects in baseline">
-                  {baseline.detections.map((object) => (
-                    <li
-                      className="object-card"
-                      key={`${object.class_name}-${object.instance_number}`}
-                      aria-label={`${object.class_name}, zone: ${object.zone}, confidence ${Math.round(object.confidence * 100)}%`}
-                    >
-                      <span className="object-symbol" aria-hidden="true">
-                        {object.class_name.slice(0, 1).toUpperCase()}
-                      </span>
-                      <span className="object-description">
-                        <strong>{objectLabel(object)}</strong>
-                        <span>{object.zone} | {Math.round(object.confidence * 100)}% confidence</span>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="empty-state">
-                  No supported objects detected. Reframe camera and re-capture layout.
-                </p>
-              )}
-              <p className="identity-note">
-                Zones are approximate image regions. Object numbers are per-scan, not persistent identities.
-              </p>
-            </>
-          ) : (
-            <div className="empty-state">
-              <span className="empty-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24">
-                  <path d="m3 10 9-7 9 7v11h-7v-7h-4v7H3z" />
-                </svg>
-              </span>
-              <p>No saved layout for <strong>{effectiveRoomName || "this room"}</strong>.</p>
-              <p>Start the webcam, point it at the room, and click <strong>Capture Original Layout</strong>.</p>
-            </div>
-          )}
-        </section>
+        <CameraPanel
+          effectiveRoomName={effectiveRoomName}
+          cameraActive={cameraActive}
+          cameraStarting={cameraStarting}
+          cameraStartCanceled={cameraStartCanceled}
+          baselineDetectionCount={baseline?.detections?.length ?? 0}
+          baselineLoading={baselineLoading}
+          busy={busy}
+          hasCurrentRoomBaseline={hasCurrentRoomBaseline}
+          canCompareSavedLayouts={Boolean(canCompareSavedLayouts)}
+          monitoringState={monitoringState}
+          monitorMessage={monitorMessage}
+          voiceEnabled={voiceEnabled}
+          voiceUnlocked={voiceUnlocked}
+          liveDetections={liveDetections}
+          knownObjectNames={knownObjectNames}
+          lastScanTime={latest?.captured_at ? formatDate(latest.captured_at) : ""}
+          videoRef={videoRef}
+          canvasRef={canvasRef}
+          onStart={startCamera}
+          onStop={stopCamera}
+          onCapture={captureLayout}
+          onShowComparison={() => void handleShowComparison()}
+          onRestoreView={handleRestoreView}
+          onInitializeVoice={handleInitializeVoice}
+          onReplayVoice={handleReplayVoice}
+          onTestVoice={handleTestVoice}
+          onToggleVoice={handleToggleVoice}
+        />
+        <BaselinePanel
+          baseline={baseline}
+          baselineLoading={baselineLoading}
+          hasCurrentRoomBaseline={hasCurrentRoomBaseline}
+          effectiveRoomName={effectiveRoomName}
+        />
       </section>
+
+      <SavedLayoutsPanel
+        key={`${effectiveRoomName}\u0000${DEFAULT_CAMERA_ID}`}
+        roomName={effectiveRoomName}
+        cameraId={DEFAULT_CAMERA_ID}
+        cameraActive={cameraActive}
+        videoRef={videoRef}
+        beforeLayout={beforeLayout}
+        afterLayout={afterLayout}
+        onComparisonLayoutSaved={handleComparisonLayoutSaved}
+        onStartNewComparison={resetSavedComparison}
+        onLayoutSaved={handleLayoutSaved}
+        onLayoutActivated={handleLayoutActivated}
+      />
 
       {/* ── BEFORE / AFTER COMPARISON MODAL ── */}
       {showComparison && comparison && (
-        <div
-          className="comparison-backdrop"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Before and after room comparison"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowComparison(false); }}
-        >
-          <div className="comparison-modal">
-            <div className="comparison-header">
-              <h2>Before &amp; After Comparison — {effectiveRoomName}</h2>
-              <button
-                className="close-button"
-                onClick={() => setShowComparison(false)}
-                aria-label="Close comparison"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="comparison-grid">
-              <DetectionOverlay
-                imageUrl={comparison.baseline?.image_data_url}
-                detections={comparison.baseline?.detections}
-                label={`Original layout — ${formatDate(comparison.baseline?.captured_at)}`}
-              />
-              <DetectionOverlay
-                imageUrl={comparison.latest?.image_data_url}
-                detections={comparison.latest?.detections}
-                label={`Latest scan — ${comparison.latest ? formatDate(comparison.latest.captured_at) : "Not yet scanned"}`}
-              />
-            </div>
-            {comparison.baseline && comparison.latest && (
-              <div className="comparison-summary">
-                <p>
-                  <strong>Original:</strong> {comparison.baseline.detections.length} object{comparison.baseline.detections.length !== 1 ? "s" : ""}
-                  &nbsp;|&nbsp;
-                  <strong>Latest:</strong> {comparison.latest.detections.length} object{comparison.latest.detections.length !== 1 ? "s" : ""}
-                </p>
-              </div>
-            )}
-          </div>
-        </div>
+        <ComparisonModal
+          comparison={comparison}
+          effectiveRoomName={effectiveRoomName}
+          voiceEnabled={voiceEnabled}
+          onReplayVoice={handleReplayVoice}
+          onTestVoice={handleTestVoice}
+          onToggleVoice={handleToggleVoice}
+          onClose={() => setShowComparison(false)}
+        />
       )}
 
       {/* ── MONITORING TABS ── */}
@@ -973,166 +927,32 @@ function App() {
           </div>
 
           {/* ── LIVE OBJECTS TAB ── */}
-          <div
-            id="tab-panel-monitor"
-            role="tabpanel"
-            className={`tab-panel ${activeTab !== "monitor" ? "tab-panel-hidden" : ""}`}
-            aria-label="Live detected objects"
-          >
-            <div className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">LIVE OBSERVATIONS</p>
-                  <h2>Latest detected objects</h2>
-                </div>
-                {cameraActive && <span className="saved-badge">Live scan</span>}
-              </div>
-              {latest?.detections?.length ? (
-                <ul className="object-list latest-list" aria-label="Currently detected objects">
-                  {latest.detections.map((object, index) => {
-                    const isOutsideBaseline = !knownObjectNames.has(object.class_name) && cameraActive;
-                    return (
-                      <li
-                        className={`object-card ${isOutsideBaseline ? "object-card-new" : ""}`}
-                        key={`${object.class_name}-${object.instance_number}-${index}`}
-                        aria-label={`${object.class_name}${isOutsideBaseline ? " — not in original layout" : ""}, zone: ${object.zone}`}
-                      >
-                        <span className="object-symbol" aria-hidden="true">
-                          {object.class_name.slice(0, 1).toUpperCase()}
-                        </span>
-                        <span className="object-description">
-                          <strong>{objectLabel(object)}{isOutsideBaseline ? " · New" : ""}</strong>
-                          <span>{object.zone} | {Math.round(object.confidence * 100)}% confidence</span>
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              ) : (
-                <p className="history-empty">
-                  {latest
-                    ? "No supported objects visible in the latest scan."
-                    : "Start monitoring to show the latest reliable camera observations."}
-                </p>
-              )}
-              {latest?.captured_at && (
-                <p className="saved-meta">Last reliable scan: {formatDate(latest.captured_at)}</p>
-              )}
-            </div>
-          </div>
+          <LiveObjects
+            isActive={activeTab === "monitor"}
+            latest={latest}
+            baseline={baseline}
+            liveComparison={liveComparison}
+            knownObjectNames={knownObjectNames}
+            cameraActive={cameraActive}
+            monitoringState={monitoringState}
+          />
 
           {/* ── HISTORY TAB ── */}
-          <div
-            id="tab-panel-history"
-            role="tabpanel"
-            className={`tab-panel ${activeTab !== "history" ? "tab-panel-hidden" : ""}`}
-            aria-label="Change alert history"
-          >
-            <div className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">CONFIRMED CHANGES</p>
-                  <h2>Alert history</h2>
-                </div>
-                <button
-                  className="repeat-button"
-                  disabled={!history.length}
-                  onClick={repeatAlertReport}
-                  aria-label="Repeat recent alerts by voice"
-                >
-                  🔊 Repeat report
-                </button>
-              </div>
-              {history.length ? (
-                <ol className="history-list" aria-label="Change alert history list">
-                  {history.map((event) => (
-                    <li className="history-item" key={event.id}>
-                      <span className={`change-badge change-${event.change_type}`} aria-label={`Change type: ${event.change_type}`}>
-                        {event.change_type.startsWith("camera_view_")
-                          ? "Camera status"
-                          : event.change_type === "moved"
-                          ? "Moved"
-                          : event.change_type === "newly_observed"
-                          ? "New object"
-                          : "Not visible"}
-                      </span>
-                      <p className="history-message">{event.message}</p>
-                      <p className="history-meta">
-                        {event.object_name} | {formatDate(event.created_at)}
-                        {event.confidence !== null && ` | ${Math.round(event.confidence * 100)}% confidence`}
-                      </p>
-                      <p className="history-meta">
-                        Voice:{" "}
-                        {event.speech_status === "spoken"
-                          ? "✓ played"
-                          : event.speech_status === "failed"
-                          ? `✗ failed${event.speech_error ? ` — ${event.speech_error}` : ""}`
-                          : event.speech_status === "unavailable"
-                          ? "unavailable"
-                          : "pending"}
-                      </p>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <p className="history-empty">
-                  No confirmed changes yet. Alerts are created only after a change appears in 3 consecutive reliable scans.
-                </p>
-              )}
-            </div>
-          </div>
+          <AlertHistory
+            isActive={activeTab === "history"}
+            history={history}
+            onRepeat={repeatAlertReport}
+          />
 
           {/* ── FIND OBJECT TAB ── */}
-          <div
-            id="tab-panel-find"
-            role="tabpanel"
-            className={`tab-panel ${activeTab !== "find" ? "tab-panel-hidden" : ""}`}
-            aria-label="Find an object by voice or text"
-          >
-            <div className="panel">
-              <div className="panel-heading">
-                <div>
-                  <p className="eyebrow">VOICE-ASSISTED FINDER</p>
-                  <h2>Find an object</h2>
-                </div>
-              </div>
-              <form
-                className="finder-form"
-                onSubmit={(event) => { event.preventDefault(); void findObject(); }}
-                aria-label="Object search form"
-              >
-                <label className="room-field finder-field">
-                  <span>Ask where an object was last seen</span>
-                  <input
-                    aria-label="Object name or question"
-                    maxLength={80}
-                    onChange={(event) => setFindQuery(event.target.value)}
-                    placeholder="e.g. Where is my bag?"
-                    value={findQuery}
-                  />
-                </label>
-                <button className="button button-primary" type="submit" aria-label="Search for object">
-                  🔎 Find object
-                </button>
-                <button
-                  className="button button-secondary"
-                  onClick={startVoiceSearch}
-                  type="button"
-                  aria-label="Ask where an object is using voice"
-                >
-                  🎤 Ask by voice
-                </button>
-              </form>
-              {findResult && (
-                <p className="finder-result" role="status" aria-live="polite">
-                  {findResult}
-                </p>
-              )}
-              <div className="finder-hint">
-                <p>Supported objects: chair, bottle, bag, backpack, handbag, couch, dining table, suitcase, and more.</p>
-              </div>
-            </div>
-          </div>
+          <FindPanel
+            isActive={activeTab === "find"}
+            findQuery={findQuery}
+            setFindQuery={setFindQuery}
+            findResult={findResult}
+            onFind={() => { void findObject(); }}
+            onVoiceSearch={startVoiceSearch}
+          />
         </section>
       )}
 
