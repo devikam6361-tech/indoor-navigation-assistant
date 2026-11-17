@@ -2,6 +2,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from database.migrations import migrate_database
+
 
 def connect_database(database_path):
     connection = sqlite3.connect(database_path, timeout=10)
@@ -79,3 +81,4 @@ def initialize_database(database_path):
             );
             """
         )
+        migrate_database(connection)

@@ -151,10 +151,27 @@ def get_comparison():
             }
         comparison_diff = None
         if baseline and latest:
-            comparison_diff = categorize_room_comparison(
+            analysis = categorize_room_comparison(
                 baseline.get("detections", []),
                 latest.get("detections", []),
             )
+            comparison_diff = {
+                "summary": {
+                    key: analysis["summary"][key]
+                    for key in (
+                        "unchanged",
+                        "moved",
+                        "new",
+                        "missing",
+                        "total_baseline",
+                        "total_latest",
+                    )
+                },
+                "unchanged": analysis["unchanged"],
+                "moved": analysis["moved"],
+                "new": analysis["new"],
+                "missing": analysis["missing"],
+            }
     return jsonify({
         "baseline": baseline,
         "latest": latest,

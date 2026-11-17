@@ -9,6 +9,7 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 # 0.12–0.44 on typical 640×480 room images. 0.5 filtered everything out.
 # Verified empirically by running inference on three saved baseline images.
 CONFIDENCE_THRESHOLD = 0.25
+CANDIDATE_CONFIDENCE_THRESHOLD = 0.15
 CHANGE_CONFIRMATION_FRAMES = 3
 MOVE_DISTANCE_THRESHOLD = 0.14
 OBJECT_COOLDOWN_SECONDS = 60
@@ -57,10 +58,15 @@ SUPPORTED_CLASSES = {
     # Books & stationery
     "book",
     "scissors",
-    # Decor & misc
+    # Decor, toys & misc
     "clock",
+    "doll",
     "hair drier",
+    "pink plush doll",
+    "plush doll",
+    "plush toy",
     "potted plant",
     "teddy bear",
     "toothbrush",
+    "toy",
 }

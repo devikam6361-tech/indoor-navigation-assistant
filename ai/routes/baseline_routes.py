@@ -1,6 +1,6 @@
 import sqlite3
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request, current_app
@@ -13,6 +13,17 @@ from services.image_processing import image_from_payload
 from utils.formatting import room_key
 
 baseline_bp = Blueprint("baseline", __name__)
+
+
+@contextmanager
+def _monitor_transaction(connection):
+    with current_app.config["MONITOR_LOCK"]:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
 
 
 @baseline_bp.get("/api/baseline")
@@ -67,75 +78,111 @@ def save_baseline():
         "+00:00", "Z"
     )
     connection = connect_database(current_app.config["DATABASE_PATH"])
+    scope_key = room_key(name)
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        previous = connection.execute(
-            """
-            SELECT id FROM observations
-            WHERE room_key = ? AND camera_id = ? AND is_baseline = 1
-            """,
-            (room_key(name), CAMERA_ID),
-        ).fetchone()
-        if previous and not payload.get("replace", False):
-            connection.rollback()
-            return (
-                jsonify(
-                    {
-                        "error": "A baseline already exists for this room. Review it and explicitly confirm replacement."
-                    }
-                ),
-                409,
-            )
+        with _monitor_transaction(connection):
+            previous = connection.execute(
+                """
+                SELECT id FROM observations
+                WHERE room_key = ? AND camera_id = ? AND is_baseline = 1
+                """,
+                (scope_key, CAMERA_ID),
+            ).fetchone()
+            if previous and not payload.get("replace", False):
+                return (
+                    jsonify(
+                        {
+                            "error": "A baseline already exists for this room. Review it and explicitly confirm replacement."
+                        }
+                    ),
+                    409,
+                )
 
-        if previous:
-            connection.execute(
-                "UPDATE observations SET is_baseline = 0 WHERE id = ?",
-                (previous["id"],),
-            )
+            if previous:
+                connection.execute(
+                    "UPDATE observations SET is_baseline = 0 WHERE id = ?",
+                    (previous["id"],),
+                )
 
-        cursor = connection.execute(
-            """
-            INSERT INTO observations (
-                room_key, room_name, camera_id, captured_at, image,
-                image_width, image_height, is_baseline
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            """,
-            (
-                room_key(name),
-                name,
-                CAMERA_ID,
-                captured_at,
-                image_bytes,
-                width,
-                height,
-            ),
-        )
-        observation_id = cursor.lastrowid
-        connection.executemany(
-            """
-            INSERT INTO detections (
-                observation_id, class_name, instance_number, confidence,
-                center_x, center_y, x1, y1, x2, y2, zone
-            ) VALUES (
-                :observation_id, :class_name, :instance_number, :confidence,
-                :center_x, :center_y, :x1, :y1, :x2, :y2, :zone
+            observation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info('observations')")
+            }
+            if "layout_name" in observation_columns:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO observations (
+                        room_key, room_name, camera_id, captured_at, image,
+                        image_width, image_height, is_baseline, layout_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    """,
+                    (
+                        scope_key,
+                        name,
+                        CAMERA_ID,
+                        captured_at,
+                        image_bytes,
+                        width,
+                        height,
+                        f"Layout {captured_at}",
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO observations (
+                        room_key, room_name, camera_id, captured_at, image,
+                        image_width, image_height, is_baseline
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (
+                        scope_key,
+                        name,
+                        CAMERA_ID,
+                        captured_at,
+                        image_bytes,
+                        width,
+                        height,
+                    ),
+                )
+            observation_id = cursor.lastrowid
+            connection.executemany(
+                """
+                INSERT INTO detections (
+                    observation_id, class_name, instance_number, confidence,
+                    center_x, center_y, x1, y1, x2, y2, zone
+                ) VALUES (
+                    :observation_id, :class_name, :instance_number, :confidence,
+                    :center_x, :center_y, :x1, :y1, :x2, :y2, :zone
+                )
+                """,
+                [
+                    {"observation_id": observation_id, **item}
+                    for item in objects
+                ],
             )
-            """,
-            [
-                {"observation_id": observation_id, **item}
-                for item in objects
-            ],
-        )
-        observation = connection.execute(
-            "SELECT * FROM observations WHERE id = ?", (observation_id,)
-        ).fetchone()
-        response = baseline_response(connection, observation)
-        connection.commit()
+            observation = connection.execute(
+                "SELECT * FROM observations WHERE id = ?", (observation_id,)
+            ).fetchone()
+            response = baseline_response(connection, observation)
+            connection.commit()
+            trackers = current_app.config["TRACKERS"]
+            for tracker_key in list(trackers):
+                if (
+                    isinstance(tracker_key, tuple)
+                    and tracker_key
+                    and tracker_key[0] == scope_key
+                ):
+                    trackers.pop(tracker_key, None)
+
     except sqlite3.Error as error:
-        connection.rollback()
+        if connection.in_transaction:
+            connection.rollback()
         current_app.logger.exception("Could not save the room baseline")
         return jsonify({"error": f"Could not save the room baseline: {error}"}), 500
     finally:
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()
 
     return jsonify({"baseline": response}), 201

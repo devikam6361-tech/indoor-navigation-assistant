@@ -17,7 +17,12 @@ from config import (
 from database.connection import connect_database, initialize_database
 from database.queries import read_recent_events
 from services.camera_validation import camera_view_status
-from services.change_detection import compare_detections, event_message, event_response
+from services.change_detection import (
+    categorize_room_comparison,
+    compare_detections,
+    event_message,
+    event_response,
+)
 from services.image_processing import image_from_payload
 from services.yolo_service import detections_from_model, get_or_load_detector
 from utils.formatting import room_key
@@ -28,6 +33,7 @@ from routes.baseline_routes import baseline_bp
 from routes.monitoring_routes import monitoring_bp
 from routes.alert_routes import alert_bp
 from routes.object_finder_routes import object_finder_bp
+from routes.layout_routes import layout_bp
 
 
 def create_app(database_path=DATABASE_PATH, detector=None):
@@ -54,6 +60,7 @@ def create_app(database_path=DATABASE_PATH, detector=None):
     app.register_blueprint(monitoring_bp)
     app.register_blueprint(alert_bp)
     app.register_blueprint(object_finder_bp)
+    app.register_blueprint(layout_bp)
 
     @app.errorhandler(RequestEntityTooLarge)
     def request_too_large(_error):
@@ -75,10 +82,29 @@ def create_app(database_path=DATABASE_PATH, detector=None):
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
 
+        custom_prompts = payload.get("prompts") or payload.get("custom_classes")
         try:
             with app.config["DETECTOR_LOCK"]:
                 model = get_or_load_detector()
                 observed = detections_from_model(model, frame, width, height)
+                if custom_prompts:
+                    try:
+                        from services.open_vocabulary_service import (
+                            get_open_vocabulary_detector,
+                            hybrid_detections,
+                        )
+                        ov_detector = get_open_vocabulary_detector()
+                        if ov_detector is not None:
+                            observed = hybrid_detections(
+                                observed,
+                                ov_detector,
+                                frame,
+                                width,
+                                height,
+                                custom_prompts=custom_prompts,
+                            )
+                    except Exception as ov_err:
+                        app.logger.warning("Live open-vocabulary detection failed: %s", ov_err)
         except Exception as error:
             app.logger.exception("Could not run local YOLO inference")
             return jsonify({"error": f"YOLO could not process the image: {error}"}), 503
@@ -182,12 +208,32 @@ def create_app(database_path=DATABASE_PATH, detector=None):
                     [event_response(camera_event)] if camera_event is not None else []
                 )
 
+                live_comparison = None
                 if view_status != "stable":
                     tracker["counts"].clear()
                     response_status = (
                         "camera_moved" if view_status == "moved" else "view_unverified"
                     )
                     latest = None
+                    live_comparison = {
+                        "status": "uncertain",
+                        "summary": {
+                            "uncertain": 1,
+                            "missing": 0,
+                            "moved": 0,
+                            "new": 0,
+                            "unchanged": 0,
+                            "total_baseline": 0,
+                            "total_latest": len(observed),
+                        },
+                        "uncertain_reason": (
+                            "camera_view_changed" if view_status == "moved" else "camera_view_unverified"
+                        ),
+                        "missing": [],
+                        "new": [],
+                        "moved": [],
+                        "unchanged": [],
+                    }
                 else:
                     baseline_detections = connection.execute(
                         """
@@ -201,6 +247,22 @@ def create_app(database_path=DATABASE_PATH, detector=None):
                     ).fetchall()
                     baseline_items = [dict(item) for item in baseline_detections]
                     candidates = compare_detections(baseline_items, observed)
+                    try:
+                        import cv2
+                        import numpy as np
+                        baseline_frame = cv2.imdecode(
+                            np.frombuffer(baseline["image"], np.uint8),
+                            cv2.IMREAD_COLOR,
+                        )
+                        live_comparison = categorize_room_comparison(
+                            baseline_items,
+                            observed,
+                            before_frame=baseline_frame,
+                            after_frame=frame,
+                        )
+                    except Exception as comp_err:
+                        app.logger.warning("Live comparison computation failed: %s", comp_err)
+                        live_comparison = None
                     active_candidates = {candidate["key"] for candidate in candidates}
                     for old_key in set(tracker["counts"]) - active_candidates:
                         tracker["counts"].pop(old_key, None)
@@ -307,6 +369,8 @@ def create_app(database_path=DATABASE_PATH, detector=None):
             {
                 "status": response_status,
                 "latest": latest,
+                "live_detections": observed,
+                "comparison": live_comparison,
                 "alerts": emitted_events,
                 "history": history,
                 "confirmed_after_frames": CHANGE_CONFIRMATION_FRAMES,
@@ -316,8 +380,6 @@ def create_app(database_path=DATABASE_PATH, detector=None):
     return app
 
 
-app = create_app()
-
-
 if __name__ == "__main__":
+    app = create_app()
     app.run(host="127.0.0.1", port=5000, debug=False)
