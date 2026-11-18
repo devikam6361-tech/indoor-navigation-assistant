@@ -103,6 +103,7 @@ export default function SavedLayoutsPanel({
   roomName,
   cameraId,
   cameraActive,
+  cameraStarting = false,
   videoRef,
   onLayoutSaved,
   onLayoutActivated,
@@ -110,6 +111,7 @@ export default function SavedLayoutsPanel({
   afterLayout,
   onComparisonLayoutSaved,
   onStartNewComparison,
+  onStartCamera,
 }) {
   const [layouts, setLayouts] = useState([]);
   const [layoutName, setLayoutName] = useState("");
@@ -181,14 +183,38 @@ export default function SavedLayoutsPanel({
       return;
     }
     const video = videoRef.current;
-    if (
-      !cameraActive
-      || !video
-      || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
-      || video.videoWidth === 0
-    ) {
+    if (!cameraActive) {
+      setActionError("Start the camera before saving an active layout.");
+      return;
+    }
+    if (!video) {
       setActionError("Wait for the live camera preview before saving a new layout.");
       return;
+    }
+
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0) {
+      try {
+        await new Promise((resolve, reject) => {
+          if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+            resolve();
+            return;
+          }
+          const checkTimer = setInterval(() => {
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+              clearInterval(checkTimer);
+              clearTimeout(timeoutTimer);
+              resolve();
+            }
+          }, 100);
+          const timeoutTimer = setTimeout(() => {
+            clearInterval(checkTimer);
+            reject(new Error("Timeout waiting for preview frames."));
+          }, 2500);
+        });
+      } catch {
+        setActionError("Wait for the live camera preview before saving a new layout.");
+        return;
+      }
     }
 
     mutationInFlight.current = true;
@@ -249,14 +275,38 @@ export default function SavedLayoutsPanel({
     }
 
     const video = videoRef.current;
-    if (
-      !cameraActive
-      || !video
-      || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
-      || video.videoWidth === 0
-    ) {
+    if (!cameraActive) {
+      setActionError("Start the camera before capturing a comparison layout.");
+      return;
+    }
+    if (!video) {
       setActionError("Wait for the live camera preview before saving a comparison layout.");
       return;
+    }
+
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0) {
+      try {
+        await new Promise((resolve, reject) => {
+          if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+            resolve();
+            return;
+          }
+          const checkTimer = setInterval(() => {
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+              clearInterval(checkTimer);
+              clearTimeout(timeoutTimer);
+              resolve();
+            }
+          }, 100);
+          const timeoutTimer = setTimeout(() => {
+            clearInterval(checkTimer);
+            reject(new Error("Timeout waiting for preview frames."));
+          }, 2500);
+        });
+      } catch {
+        setActionError("Wait for the live camera preview before saving a comparison layout.");
+        return;
+      }
     }
 
     mutationInFlight.current = true;
@@ -406,52 +456,141 @@ export default function SavedLayoutsPanel({
       </form>
 
       <div className="layout-list-heading">
-        <h3>Before &amp; After capture</h3>
+        <div className="heading-with-sub">
+          <h3>Before &amp; After Capture</h3>
+          <p className="layout-help-text">
+            Capture BEFORE, rearrange room objects, then capture AFTER. Stored independently without replacing the active baseline.
+          </p>
+        </div>
         {hasBeforeLayout && hasAfterLayout && (
           <button
-            className="layout-refresh-button"
+            className="layout-refresh-button layout-new-comparison-btn"
             disabled={busyAction !== ""}
             onClick={onStartNewComparison}
             type="button"
           >
-            Start another comparison
+            ↺ Start Another Comparison
           </button>
         )}
       </div>
-      <p className="layout-help-text">
-        Save BEFORE, change the room arrangement, then save AFTER. These captures are stored independently and do not replace the active monitoring baseline.
-      </p>
-      <div className="layout-save-form">
-        <div className="room-field">
-          <span>Original arrangement</span>
-          <p className="layout-help-text">
-            {hasBeforeLayout ? `Saved as layout ${beforeLayout.id}.` : "Capture this before changing the room."}
-          </p>
+
+      <div className="comparison-capture-grid">
+        {/* BEFORE CAPTURE CARD */}
+        <div className={`comparison-capture-card before-card ${hasBeforeLayout ? "is-captured" : ""}`}>
+          <div className="capture-card-header">
+            <span className="capture-card-badge before-badge">BEFORE</span>
+            <span className="capture-card-title">Original Room Layout</span>
+            {hasBeforeLayout && <span className="capture-status-pill">✓ Saved</span>}
+          </div>
+
+          <div className="capture-card-body">
+            {hasBeforeLayout && beforeLayout?.image_data_url ? (
+              <div className="capture-preview-box">
+                <img
+                  src={beforeLayout.image_data_url}
+                  alt="Original layout before"
+                  className="capture-thumb-img"
+                />
+                <div className="capture-info">
+                  <strong className="capture-layout-name">{beforeLayout.layout_name || "Before – Original Layout"}</strong>
+                  <span className="capture-meta-date">
+                    Captured {beforeLayout.captured_at ? formatDate(beforeLayout.captured_at) : "Saved"}
+                  </span>
+                  <span className="capture-meta-id">Layout #{beforeLayout.id}</span>
+                </div>
+              </div>
+            ) : (
+              <div className="capture-empty-box">
+                <span className="capture-icon">📷</span>
+                <p className="capture-prompt">
+                  {!cameraActive
+                    ? "Camera is off. Start the camera to view the room and capture the original layout."
+                    : "Webcam is live. Point it at the room and capture the original layout."}
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="capture-card-footer">
+            {!cameraActive ? (
+              <button
+                className="button button-crimson layout-save-button"
+                disabled={cameraStarting || busyAction !== ""}
+                onClick={() => onStartCamera?.()}
+                type="button"
+              >
+                {cameraStarting ? "⏳ Starting Camera..." : "📷 Start Camera to Capture"}
+              </button>
+            ) : (
+              <button
+                className="button button-secondary layout-save-button"
+                disabled={!roomName.trim() || !cameraActive || hasBeforeLayout || busyAction !== ""}
+                onClick={() => void handleSaveComparisonLayout("before")}
+                type="button"
+              >
+                {busyAction === "save-before"
+                  ? "Saving BEFORE..."
+                  : hasBeforeLayout
+                    ? "✓ BEFORE Captured"
+                    : "Capture BEFORE Layout"}
+              </button>
+            )}
+          </div>
         </div>
-        <button
-          className="button button-primary layout-save-button"
-          disabled={!roomName.trim() || !cameraActive || hasBeforeLayout || busyAction !== ""}
-          onClick={() => void handleSaveComparisonLayout("before")}
-          type="button"
-        >
-          {busyAction === "save-before" ? "Saving BEFORE..." : "Capture BEFORE layout"}
-        </button>
-      </div>
-      <div className="layout-save-form">
-        <div className="room-field">
-          <span>Updated arrangement</span>
-          <p className="layout-help-text">
-            {hasAfterLayout ? `Saved as layout ${afterLayout.id}.` : "Capture this after changing the room."}
-          </p>
+
+        {/* AFTER CAPTURE CARD */}
+        <div className={`comparison-capture-card after-card ${hasAfterLayout ? "is-captured" : ""}`}>
+          <div className="capture-card-header">
+            <span className="capture-card-badge after-badge">AFTER</span>
+            <span className="capture-card-title">Updated Room Layout</span>
+            {hasAfterLayout && <span className="capture-status-pill">✓ Saved</span>}
+          </div>
+
+          <div className="capture-card-body">
+            {hasAfterLayout && afterLayout?.image_data_url ? (
+              <div className="capture-preview-box">
+                <img
+                  src={afterLayout.image_data_url}
+                  alt="Updated layout after"
+                  className="capture-thumb-img"
+                />
+                <div className="capture-info">
+                  <strong className="capture-layout-name">{afterLayout.layout_name || "After – Updated Layout"}</strong>
+                  <span className="capture-meta-date">
+                    Captured {afterLayout.captured_at ? formatDate(afterLayout.captured_at) : "Saved"}
+                  </span>
+                  <span className="capture-meta-id">Layout #{afterLayout.id}</span>
+                </div>
+              </div>
+            ) : (
+              <div className="capture-empty-box">
+                <span className="capture-icon">🔄</span>
+                <p className="capture-prompt">
+                  {!hasBeforeLayout
+                    ? "Capture BEFORE layout first, then rearrange items."
+                    : !cameraActive
+                    ? "Start the camera to capture the updated layout."
+                    : "Rearrange room objects, then capture this updated layout."}
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="capture-card-footer">
+            <button
+              className="button button-crimson layout-save-button"
+              disabled={!roomName.trim() || !cameraActive || !hasBeforeLayout || hasAfterLayout || busyAction !== ""}
+              onClick={() => void handleSaveComparisonLayout("after")}
+              type="button"
+            >
+              {busyAction === "save-after"
+                ? "Saving AFTER..."
+                : hasAfterLayout
+                  ? "✓ AFTER Captured"
+                  : "Capture AFTER Layout"}
+            </button>
+          </div>
         </div>
-        <button
-          className="button button-primary layout-save-button"
-          disabled={!roomName.trim() || !cameraActive || !hasBeforeLayout || hasAfterLayout || busyAction !== ""}
-          onClick={() => void handleSaveComparisonLayout("after")}
-          type="button"
-        >
-          {busyAction === "save-after" ? "Saving AFTER..." : "Capture AFTER layout"}
-        </button>
       </div>
 
       {success && <p className="layout-message layout-success" role="status" aria-live="polite">{success}</p>}
@@ -533,6 +672,24 @@ export default function SavedLayoutsPanel({
                           : isDeleted
                             ? "Deleted layouts cannot be restored"
                             : "Restore layout"}
+                    </button>
+                    <button
+                      className="layout-action-button"
+                      disabled={busyAction !== "" || isDeleted}
+                      onClick={() => onComparisonLayoutSaved("before", layout)}
+                      type="button"
+                      title="Set as BEFORE reference layout"
+                    >
+                      {beforeLayout?.id === layout.id ? "✓ In BEFORE" : "Set as BEFORE"}
+                    </button>
+                    <button
+                      className="layout-action-button"
+                      disabled={busyAction !== "" || isDeleted}
+                      onClick={() => onComparisonLayoutSaved("after", layout)}
+                      type="button"
+                      title="Set as AFTER comparison layout"
+                    >
+                      {afterLayout?.id === layout.id ? "✓ In AFTER" : "Set as AFTER"}
                     </button>
                     <button
                       className="layout-action-button layout-delete-button"

@@ -7,8 +7,8 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   font-weight: 400;
-  color: #263b36;
-  background: #f4f7f5;
+  color: #F4F5F7;
+  background: #171A21;
 }
 
 * {
@@ -19,6 +19,8 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  background: #171A21;
+  color: #F4F5F7;
 }
 
 button,

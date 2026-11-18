@@ -88,3 +88,61 @@ export async function deleteLayout(layoutId, roomName, cameraId) {
     }),
   );
 }
+
+// ===============================
+// VIDEO UPLOAD AND FRAME EXTRACTION
+// ===============================
+
+// Upload multiple videos for processing and frame extraction
+export async function uploadVideos(videoFiles) {
+  const formData = new FormData();
+
+  videoFiles.forEach((file) => {
+    formData.append("videos", file);
+  });
+
+  const response = await fetch("/api/videos/upload", {
+    method: "POST",
+    body: formData,
+  });
+
+  return readJson(response);
+}
+
+// Get all uploaded videos and their extracted frame information
+export async function fetchVideos() {
+  const response = await fetch("/api/videos");
+  return readJson(response);
+}
+
+// Generate the URL for an extracted frame
+export function getVideoFrameUrl(videoId, filename) {
+  return `/api/videos/${encodeURIComponent(
+    videoId
+  )}/frames/${encodeURIComponent(filename)}`;
+}
+
+// Generate the URL for the raw uploaded video source
+export function getVideoSourceUrl(videoId) {
+  return `/api/videos/${encodeURIComponent(videoId)}/source`;
+}
+
+// Compare two video frames to detect room changes
+export async function compareVideos({
+  beforeVideoId,
+  afterVideoId,
+  beforeFrame = "frame_0000.jpg",
+  afterFrame = "frame_0000.jpg",
+}) {
+  const response = await fetch("/api/videos/compare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      before_video_id: beforeVideoId,
+      after_video_id: afterVideoId,
+      before_frame: beforeFrame,
+      after_frame: afterFrame,
+    }),
+  });
+  return readJson(response);
+}
